@@ -1,0 +1,21 @@
+name: FMS Tracking
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:        # lets you run it manually too
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    concurrency:            # never let two runs overlap
+      group: fms-tracking
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      - run: python fms_to_sheets.py
