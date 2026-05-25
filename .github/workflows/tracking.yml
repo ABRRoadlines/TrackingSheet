@@ -9,10 +9,6 @@ on:
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
-    concurrency:
-      group: fms-tracking
-      cancel-in-progress: false
       
     steps:
       - uses: actions/checkout@v4
