@@ -25,8 +25,8 @@ load_dotenv()
 SHEET_ID            = "1-tEwE7YwZFNhfGjvgZPHYMKXJqSr_TOmrAodfuadGf0"   # MASTER
 SHEET_NAME          = "Tracking"
 VEHICLE_DETAILS_TAB = "Vehicle Details"   # legacy — superseded by VEHICLES_TAB
-VEHICLES_TAB        = "Vehicles"          # Vehicle No | Vehicle Type | Vehicle Hub
-VEHICLES_HEADERS    = ["Vehicle No", "Vehicle Type", "Vehicle Hub"]
+VEHICLES_TAB        = "Vehicles"          # Vehicle No | Vehicle Type | Vehicle Hub | Vehicle Route
+VEHICLES_HEADERS    = ["Vehicle No", "Vehicle Type", "Vehicle Hub", "Vehicle Route"]
 ROUTE_CODES_TAB     = "Route Codes"
 STOPPAGE_LOG_TAB      = "Stoppage Log"
 HUB_LOCATIONS_TAB     = "Hub Locations"
@@ -114,7 +114,7 @@ STOPLOG_HEADERS = [
 # Types: auto | key | lock | static | manual
 COLUMNS = [
     (0,  "S.No",                              "auto"),
-    (1,  "Vehicle_Route",                     "static"),   # user fills; never written
+    (1,  "Vehicle_Route",                     "auto"),     # from Vehicles tab (master)
     (2,  "RPS_No",                            "auto"),
     (3,  "Vehicle_No",                        "key"),      # anchor — row locked forever
     (4,  "Vehicle_Type",                      "auto"),
@@ -874,19 +874,22 @@ def compute_sla_delay(route_code: str, sla_map: dict, dispatch_str: str,
     return "00:00:00", "On Time"
 
 
-def load_vehicles_tab(ws: gspread.Worksheet) -> tuple[dict, dict, set]:
+def load_vehicles_tab(ws: gspread.Worksheet) -> tuple[dict, dict, dict, set]:
     """
-    Read the master 'Vehicles' tab (Vehicle No | Vehicle Type | Vehicle Hub).
+    Read the master 'Vehicles' tab:
+        Vehicle No | Vehicle Type | Vehicle Hub | Vehicle Route
 
     Returns:
-        vt_map   {vehicle_no: vehicle_type}   — operator-maintained types
-        hub_map  {vehicle_no: hub}            — routing key (e.g. "Ambala")
-        present  {vehicle_no, …}              — every vehicle already listed
+        vt_map     {vehicle_no: vehicle_type}   — operator-maintained types
+        hub_map    {vehicle_no: hub}            — routing key (e.g. "Ambala")
+        route_map  {vehicle_no: vehicle_route}  — fills Vehicle_Route column
+        present    {vehicle_no, …}              — every vehicle already listed
     """
     rows = ws.get_all_values()
-    vt_map: dict = {}
-    hub_map: dict = {}
-    present: set = set()
+    vt_map:    dict = {}
+    hub_map:   dict = {}
+    route_map: dict = {}
+    present:   set  = set()
     for r in rows[1:]:   # skip header
         vno = r[0].strip() if len(r) > 0 else ""
         if not vno:
@@ -894,11 +897,11 @@ def load_vehicles_tab(ws: gspread.Worksheet) -> tuple[dict, dict, set]:
         present.add(vno)
         vtype = r[1].strip() if len(r) > 1 else ""
         hub   = r[2].strip() if len(r) > 2 else ""
-        if vtype:
-            vt_map[vno] = vtype
-        if hub:
-            hub_map[vno] = hub
-    return vt_map, hub_map, present
+        route = r[3].strip() if len(r) > 3 else ""
+        if vtype: vt_map[vno]    = vtype
+        if hub:   hub_map[vno]   = hub
+        if route: route_map[vno] = route
+    return vt_map, hub_map, route_map, present
 
 
 def load_hub_coords_tab(ws: gspread.Worksheet) -> dict[str, tuple[float, float]]:
@@ -1040,7 +1043,8 @@ def build_row(v: dict, sno: int, existing_arrival: str,
               consignee_codes:    list[str] | None = None,
               hub_coords_by_code: dict | None = None,
               route_hub_names:    list[str] | None = None,
-              sla_map:            dict | None = None) -> list:
+              sla_map:            dict | None = None,
+              vehicle_route_map:  dict | None = None) -> list:
     stage, _  = derive_stage(v, hub_coords, consignee_codes, hub_coords_by_code,
                              prev_snap, route_hub_names)
     status    = derive_status(v, stage)
@@ -1095,6 +1099,9 @@ def build_row(v: dict, sno: int, existing_arrival: str,
         if ctype == "lock":        row[idx] = arrival; continue
 
         if   idx == 0:  row[idx] = sno
+        elif idx == 1:
+            vno = fmt(v.get("vehicleNumber"))
+            row[idx] = (vehicle_route_map or {}).get(vno, "")
         elif idx == 2:  row[idx] = fmt(rps)
         elif idx == 3:  row[idx] = fmt(v.get("vehicleNumber"))
         elif idx == 4:
@@ -1323,9 +1330,9 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
         append_lookup_rows(rc_ws, new_hubs)
         print(f"  [Route Codes] +{len(new_hubs)} new hub(s) discovered", flush=True)
 
-    # ── Vehicles tab (Vehicle No | Vehicle Type | Vehicle Hub) ────────────────
+    # ── Vehicles tab (Vehicle No | Vehicle Type | Vehicle Hub | Vehicle Route) ─
     veh_ws = get_or_create_tab(ss, VEHICLES_TAB, VEHICLES_HEADERS)
-    vt_map, vehicle_hub, present = load_vehicles_tab(veh_ws)
+    vt_map, vehicle_hub, vehicle_route, present = load_vehicles_tab(veh_ws)
 
     new_veh = []
     for v in vehicles:
@@ -1335,7 +1342,7 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
         vtype = vt_map.get(vno) or vehicle_type(v)
         if vtype:
             vt_map[vno] = vtype
-        new_veh.append([vno, vtype, ""])    # blank hub — operator assigns
+        new_veh.append([vno, vtype, "", ""])    # blank hub + blank route
         present.add(vno)
     if new_veh:
         veh_ws.append_rows(new_veh, value_input_option="RAW")
@@ -1373,6 +1380,7 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
         "hub_map":            hub_map,
         "vt_map":             vt_map,
         "vehicle_hub":        vehicle_hub,
+        "vehicle_route":      vehicle_route,
         "sla_map":            sla_map,
         "existing_sla_codes": existing_sla_codes,
         "sla_ws":             sla_ws,
@@ -1394,6 +1402,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     hub_coords_by_code = shared["hub_coords_by_code"]
     hub_map            = shared["hub_map"]
     vt_sheet           = shared["vt_map"]
+    vehicle_route_map  = shared["vehicle_route"]
     existing_hub_codes = shared["existing_hub_codes"]
     existing_hub_names = shared["existing_hub_names"]
     hl_ws              = shared["hl_ws"]
@@ -1512,7 +1521,8 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
 
             row_data = build_row(v, sno, lock_vals.get(vno, ""), hub_map, vt_sheet,
                                  hub_coords, prev_snap, consignee_codes,
-                                 hub_coords_by_code, route_hub_names, sla_map)
+                                 hub_coords_by_code, route_hub_names, sla_map,
+                                 vehicle_route_map)
 
             # ── Per-cell freeze (vno-indexed; survives any sort of Tracking) ─
             # New trip (new RPS) → overwrite everything. Same trip → for each
