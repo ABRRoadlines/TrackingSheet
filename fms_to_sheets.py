@@ -1401,26 +1401,32 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     existing_sla_codes = shared["existing_sla_codes"]
     sla_ws             = shared["sla_ws"]
 
-    # ── ONE sheet read — header check, snapshot, row map, lock values ─────────
+    # ── Tracking: read once. Indexed by Vehicle_No so user-sort doesn't matter.
     all_rows = ws.get_all_values()
     existing_header = all_rows[0] if all_rows else []
     write_headers(ws, existing_header)
     stage_snapshot, row_map, lock_vals = _parse_sheet(all_rows)
+    live_by_vno: dict[str, list] = {
+        vno: all_rows[rnum - 1]
+        for vno, rnum in row_map.items()
+        if 0 <= rnum - 1 < len(all_rows)
+    }
 
-    # ── Shadow tab — what the script last wrote (to detect user edits) ────────
+    # ── Shadow: independent layout, ALSO keyed by Vehicle_No. Whatever order
+    #     the user sorts Tracking into, the shadow keeps its own positions
+    #     and the per-cell freeze still finds the right baseline by vno.
     shadow_ws  = get_or_create_shadow(ss)
     shadow_all = shadow_ws.get_all_values()
+    shadow_row_of: dict[str, int] = {}
+    shadow_by_vno: dict[str, list] = {}
+    for i, row in enumerate(shadow_all[1:], start=DATA_START):
+        svno = row[KEY_COL].strip() if len(row) > KEY_COL else ""
+        if svno:
+            shadow_row_of[svno] = i
+            shadow_by_vno[svno] = row
 
-    def _live(row_num: int, idx: int) -> str:
-        r = row_num - 1
-        return all_rows[r][idx].strip() if 0 <= r < len(all_rows) and idx < len(all_rows[r]) else ""
-
-    def _shadow(row_num: int, idx: int) -> str:
-        r = row_num - 1
-        return shadow_all[r][idx].strip() if 0 <= r < len(shadow_all) and idx < len(shadow_all[r]) else ""
-
-    # Assign rows (existing vehicles keep their row; new ones appended)
-    next_row = max(row_map.values(), default=DATA_START - 1) + 1
+    # Assign a Tracking row for each vehicle (existing keep theirs; new appended).
+    next_trk_row = max(row_map.values(), default=DATA_START - 1) + 1
     assignments: dict[str, int] = {}
     valid_vnos: set = set()
     for v in vehicles:
@@ -1431,13 +1437,22 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
         if vno in row_map:
             assignments[vno] = row_map[vno]
         else:
-            assignments[vno] = next_row
-            row_map[vno]     = next_row
-            next_row        += 1
+            assignments[vno] = next_trk_row
+            row_map[vno]     = next_trk_row
+            next_trk_row    += 1
 
-    value_updates:  list = []
-    color_requests: list = []
-    stage_map:      dict = {}
+    # Assign a shadow row (independent of Tracking). Existing vno keeps its
+    # shadow row; new ones are appended to the shadow.
+    next_shd_row = max(shadow_row_of.values(), default=DATA_START - 1) + 1
+    for vno in valid_vnos:
+        if vno not in shadow_row_of:
+            shadow_row_of[vno] = next_shd_row
+            next_shd_row      += 1
+
+    tracking_updates: list = []
+    shadow_updates:   list = []
+    color_requests:   list = []
+    stage_map:        dict = {}
     missing_coord_hubs: dict[str, str] = {}
     missing_sla:    dict = {}    # route_code → True, pending operator SLA hours
     edits_kept = 0
@@ -1499,22 +1514,35 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
                                  hub_coords, prev_snap, consignee_codes,
                                  hub_coords_by_code, route_hub_names, sla_map)
 
-            # ── Per-cell freeze ──────────────────────────────────────────────
+            # ── Per-cell freeze (vno-indexed; survives any sort of Tracking) ─
             # New trip (new RPS) → overwrite everything. Same trip → for each
-            # cell, if the sheet value differs from what we last wrote (shadow),
-            # the user edited it → preserve it; otherwise write the fresh value.
+            # cell, if the Tracking value differs from what we last wrote
+            # (shadow), the user edited it → preserve it; otherwise refresh.
+            trk_row    = row_num
+            shd_row    = shadow_row_of[vno]
+            live_row   = live_by_vno.get(vno)        # None if new in Tracking
+            shadow_row = shadow_by_vno.get(vno)      # None if new in shadow
             cur_rps    = fmt(v.get("tripId")) if v.get("isOnTrip") else ""
-            shadow_vno = _shadow(row_num, KEY_COL)
-            new_trip   = (shadow_vno != vno) or (bool(cur_rps) and cur_rps != _shadow(row_num, 2))
+            shadow_rps = (shadow_row[2].strip() if shadow_row and len(shadow_row) > 2 else "")
+            new_trip   = (shadow_row is None) or (bool(cur_rps) and cur_rps != shadow_rps)
 
             for col_idx, value in enumerate(row_data):
                 if value is None:
                     continue   # None = manual / static / unset lock — never touch
-                if not new_trip and _live(row_num, col_idx) != _shadow(row_num, col_idx):
-                    edits_kept += 1
-                    continue   # user-edited this cell → preserve until next trip
-                value_updates.append({
-                    "range":  f"{COL_LETTERS[col_idx]}{row_num}",
+                if not new_trip:
+                    live_val   = (live_row[col_idx].strip()
+                                  if live_row and col_idx < len(live_row) else "")
+                    shadow_val = (shadow_row[col_idx].strip()
+                                  if shadow_row and col_idx < len(shadow_row) else "")
+                    if live_val != shadow_val:
+                        edits_kept += 1
+                        continue   # user-edited → preserve until next trip
+                tracking_updates.append({
+                    "range":  f"{COL_LETTERS[col_idx]}{trk_row}",
+                    "values": [[value]],
+                })
+                shadow_updates.append({
+                    "range":  f"{COL_LETTERS[col_idx]}{shd_row}",
                     "values": [[value]],
                 })
 
@@ -1523,9 +1551,9 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             ontime_color = ONTIME_COLORS.get(row_data[12], WHITE)
 
             color_requests.extend([
-                _cell_color(ws.id, row_num, 10, status_color),   # Status
-                _cell_color(ws.id, row_num, 11, stage_color),    # Current_Stage
-                _cell_color(ws.id, row_num, 12, ontime_color),   # Ontime_Delay
+                _cell_color(ws.id, trk_row, 10, status_color),   # Status
+                _cell_color(ws.id, trk_row, 11, stage_color),    # Current_Stage
+                _cell_color(ws.id, trk_row, 12, ontime_color),   # Ontime_Delay
             ])
 
         except Exception as exc:
@@ -1537,15 +1565,21 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
         print(f"  [WARN] {skipped} vehicle(s) skipped due to errors above", flush=True)
 
     # Blank rows for vehicles that no longer belong in this (hub) sheet.
+    # Blank BOTH Tracking and shadow rows so the freeze resets if the vehicle
+    # returns to this hub later.
     removed = 0
     if remove_strangers:
         blank_row = [""] * TOTAL_COLS
         last_col  = COL_LETTERS[-1]
         for vno, rnum in row_map.items():
             if vno not in valid_vnos:
-                value_updates.append({"range":  f"A{rnum}:{last_col}{rnum}",
-                                      "values": [blank_row]})
+                tracking_updates.append({"range":  f"A{rnum}:{last_col}{rnum}",
+                                         "values": [blank_row]})
                 removed += 1
+                shd_rnum = shadow_row_of.get(vno)
+                if shd_rnum:
+                    shadow_updates.append({"range":  f"A{shd_rnum}:{last_col}{shd_rnum}",
+                                           "values": [blank_row]})
 
     # Surface planned hubs that need coordinates (master only).
     if do_side_effects and missing_coord_hubs:
@@ -1572,27 +1606,23 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
 
     if dry_run:
         print(f"  [DRY RUN] {ws.spreadsheet.title}/{ws.title}: "
-              f"{len(assignments)} rows, {len(value_updates)} cell updates, "
+              f"{len(assignments)} rows, {len(tracking_updates)} cell updates, "
               f"{removed} stale row(s), {edits_kept} user edit(s) kept "
               f"— write skipped.", flush=True)
         return
 
-    if value_updates:
-        # gspread.batch_update() rewrites each dict's "range" in place (adds the
-        # sheet prefix), so the shadow needs its OWN copy built BEFORE the first
-        # write — otherwise its ranges get double-prefixed.
-        shadow_updates = [{"range": u["range"], "values": u["values"]}
-                          for u in value_updates]
-        ws.batch_update(value_updates, value_input_option="RAW")
-        # Mirror the exact same writes into the shadow so it always equals
-        # "what the script last wrote" → next run can detect user edits.
-        _ensure_rows(shadow_ws, max(assignments.values(), default=DATA_START))
+    if tracking_updates:
+        ws.batch_update(tracking_updates, value_input_option="RAW")
+    if shadow_updates:
+        # Shadow has its own row positions (vno-keyed). Keeps the per-cell
+        # freeze working even if the user sorts the Tracking tab.
+        _ensure_rows(shadow_ws, max(shadow_row_of.values(), default=DATA_START))
         shadow_ws.batch_update(shadow_updates, value_input_option="RAW")
     if color_requests:
         ws.spreadsheet.batch_update({"requests": color_requests})
 
     print(f"  [{ws.spreadsheet.title}/{ws.title}] {len(assignments)} rows | "
-          f"{len(value_updates)} cells | {len(color_requests)} colors"
+          f"{len(tracking_updates)} cells | {len(color_requests)} colors"
           f"{f' | {removed} removed' if removed else ''}"
           f"{f' | {edits_kept} edits kept' if edits_kept else ''}", flush=True)
 
