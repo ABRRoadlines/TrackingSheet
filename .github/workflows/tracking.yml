@@ -9,12 +9,16 @@ on:
 jobs:
   track:
     runs-on: ubuntu-latest
-      
+    timeout-minutes: 8
+    env:                       # ← add this
+      TZ: Asia/Kolkata         # ← IST for all datetime.now() calls
+    concurrency:
+      group: fms-tracking
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: 
-          python-version: '3.11'
+        with: { python-version: '3.11' }
       - run: pip install -r requirements.txt
       - run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
         env:
