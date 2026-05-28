@@ -24,7 +24,6 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 SHEET_ID            = "1-tEwE7YwZFNhfGjvgZPHYMKXJqSr_TOmrAodfuadGf0"   # MASTER
 SHEET_NAME          = "Tracking"
-VEHICLE_DETAILS_TAB = "Vehicle Details"   # legacy — superseded by VEHICLES_TAB
 VEHICLES_TAB        = "Vehicles"          # Vehicle No | Vehicle Type | Vehicle Hub | Vehicle Route
 VEHICLES_HEADERS    = ["Vehicle No", "Vehicle Type", "Vehicle Hub", "Vehicle Route"]
 ROUTE_CODES_TAB     = "Route Codes"
@@ -121,33 +120,44 @@ COLUMNS = [
     (5,  "Route",                             "auto"),
     (6,  "Route_Code",                        "auto"),
     (7,  "Route_Start_Date_Time",             "auto"),
-    (8,  "Route_Schedule_Reaching_Date_Time", "auto"),
-    (9,  "Route_Reaching_Date_Time",          "lock"),     # written once at arrival
-    (10, "Status",                            "auto"),
-    (11, "Current_Stage",                     "auto"),     # color-coded
-    (12, "Ontime_Delay",                      "auto"),
-    (13, "Current_Location",                  "auto"),
-    (14, "Delay_Hrs",                         "auto"),
-    (15, "Reason",                            "manual"),
-    (16, "Driver_Name",                       "manual"),
-    (17, "Driver_Code",                       "manual"),
-    (18, "Fix_Advance",                       "manual"),
-    (19, "Advance",                           "manual"),
-    (20, "DSL_LTR",                           "manual"),
-    (21, "DSL_Amount",                        "manual"),
-    (22, "Toll",                              "manual"),
-    (23, "Challan_MH_Border",                 "manual"),
-    (24, "In_Route_Extra_DSL",                "manual"),
-    (25, "In_Route_Maintenance_Exp",          "manual"),
-    (26, "Current_Stop_Since",                "auto"),
-    (27, "Current_Stop_Duration",             "auto"),
-    (28, "Last_GPS_Update",                   "auto"),
-    (29, "Last_Refreshed",                    "auto"),
+    (8,  "Route_Reaching_Date_Time",          "lock"),     # written once at arrival
+    (9,  "Status",                            "auto"),
+    (10, "Current_Stage",                     "auto"),     # color-coded
+    (11, "Ontime_Delay",                      "auto"),
+    (12, "Current_Location",                  "auto"),
+    (13, "Delay_Hrs",                         "auto"),
+    (14, "Reason",                            "manual"),
+    (15, "Driver_Name",                       "manual"),
+    (16, "Driver_Code",                       "manual"),
+    (17, "Given_Advance",                     "manual"),
+    (18, "Given_Diesel_Litre",                "manual"),
+    (19, "Given_Diesel_Amount",               "manual"),
+    (20, "Given_Toll",                        "manual"),
+    (21, "Given_Challan",                     "manual"),
+    (22, "Extra_Diesel",                      "manual"),
+    (23, "In_Route_Mainenance",               "manual"),
+    (24, "Current_Stop_Since",                "auto"),
+    (25, "Current_Stop_Duration",             "auto"),
+    (26, "Last_GPS_Update",                   "auto"),
+    (27, "Last_Refreshed",                    "auto"),
 ]
 
 KEY_COL    = 3    # Vehicle_No
-LOCK_COL   = 9    # Route_Reaching_Date_Time
-STAGE_COL  = 11   # Current_Stage (colored)
+LOCK_COL   = 8    # Route_Reaching_Date_Time
+STAGE_COL  = 10   # Current_Stage (colored)
+
+# Columns removed/renamed — auto-deleted from sheets on first run.
+_STALE_COLUMNS = [
+    "Route_Schedule_Reaching_Date_Time",
+    "Fix_Advance",
+    "Advance",
+    "DSL_LTR",
+    "DSL_Amount",
+    "Toll",
+    "Challan_MH_Border",
+    "In_Route_Extra_DSL",
+    "In_Route_Maintenance_Exp",
+]
 TOTAL_COLS = len(COLUMNS)
 HEADER_ROW = 1
 DATA_START = 2
@@ -965,6 +975,18 @@ def append_lookup_rows(ws: gspread.Worksheet, new_entries: dict):
 
 def write_headers(ws: gspread.Worksheet, existing_header_row: list):
     """Write header row only when it has actually changed (uses pre-loaded data)."""
+    # One-time migration: delete any stale columns no longer in the layout.
+    for stale in _STALE_COLUMNS:
+        if stale in existing_header_row:
+            col_idx = existing_header_row.index(stale)
+            ws.spreadsheet.batch_update({"requests": [{"deleteDimension": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                          "startIndex": col_idx, "endIndex": col_idx + 1},
+            }}]})
+            existing_header_row.pop(col_idx)
+            print(f"  [Migration] Deleted stale column '{stale}' from "
+                  f"{ws.spreadsheet.title}/{ws.title}", flush=True)
+
     headers = [c[1] for c in COLUMNS]
     if existing_header_row[:len(headers)] == headers:
         return
@@ -1116,21 +1138,20 @@ def build_row(v: dict, sno: int, existing_arrival: str,
                 row[idx] = NOT_ASSIGNED if not v.get("isOnTrip") else ""
         elif idx == 6:  row[idx] = route_code or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
         elif idx == 7:  row[idx] = fmt(v.get("dispatchDate"))   or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
-        elif idx == 8:  row[idx] = eta                          or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
-        elif idx == 10: row[idx] = status
-        elif idx == 11: row[idx] = stage
-        elif idx == 12:
+        elif idx == 9:  row[idx] = status
+        elif idx == 10: row[idx] = stage
+        elif idx == 11:
             if sla_label is not None:                 # our SLA calc
                 row[idx] = sla_label
             else:                                     # FMS fallback (no SLA yet)
                 ontime = fmt(v.get("ontime"))
                 row[idx] = ontime if ontime else ("Not On Trip" if not v.get("isOnTrip") else "")
-        elif idx == 13:
+        elif idx == 12:
             loc = fmt(v.get("lastLocation"))
             # Normalise double prefix: "AT at safexpress …" → "AT safexpress …"
             loc = re.sub(r'^(at\s+){2,}', 'AT ', loc, flags=re.IGNORECASE)
             row[idx] = loc
-        elif idx == 14:
+        elif idx == 13:
             if sla_delay is not None:                 # our SLA calc
                 row[idx] = sla_delay
             elif not v.get("isOnTrip"):               # FMS fallback
@@ -1138,9 +1159,9 @@ def build_row(v: dict, sno: int, existing_arrival: str,
             else:
                 delay_hrs = parse_delay_hrs(v.get("delayTime") or "")
                 row[idx] = hrs_to_hms(delay_hrs) if delay_hrs > 0 else "00:00:00"
-        elif idx == 26:
+        elif idx == 24:
             row[idx] = via_since   # earliest start; GPS-glitch-resistant for via stops
-        elif idx == 27:
+        elif idx == 25:
             if stage in hub_stop_stages and via_since:
                 # Recalculate from preserved start → immune to GPS glitch resets
                 since_dt = _parse_since_dt(via_since)
@@ -1148,7 +1169,7 @@ def build_row(v: dict, sno: int, existing_arrival: str,
                            else fmt(v.get("stoppageDuration"))
             else:
                 row[idx] = fmt(v.get("stoppageDuration"))
-        elif idx == 28:
+        elif idx == 26:
             raw = fmt(v.get("lastLocationDatetime"))
             if raw:
                 try:   # API returns "YYYY-MM-DD HH:MM:SS" — reformat to match other cols
@@ -1158,111 +1179,36 @@ def build_row(v: dict, sno: int, existing_arrival: str,
                     row[idx] = raw   # unknown format — keep as-is
             else:
                 row[idx] = ""
-        elif idx == 29: row[idx] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        elif idx == 27: row[idx] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         else:           row[idx] = ""
     return row
 
 
 # ── Main update ────────────────────────────────────────────────────────────────
 
-_LOG_STAGES = {"At Via Stop", "Halted on Road"}
-
-
-def detect_and_log_long_stops(ss, snapshot: dict, vehicles: list[dict],
-                               stage_map: dict | None = None):
+def _collect_via_departures(snapshot: dict, stage_map: dict) -> list[dict]:
     """
-    Compare previous snapshot against fresh API data and log any stop that
-    COMPLETED this cycle.
-
-    Which stops get logged:
-      • "At Via Stop"    — always (detention billing, any duration)
-      • "Halted on Road" — only if duration ≥ ROAD_HALT_LOG_HRS (filters trivial pauses)
-
-    stage_map: {vno: new_stage_str} already computed by write_tracking() this cycle.
-               Pass it in to avoid a redundant full derive_stage() call per vehicle.
-
-    Remarks written to the log:
-      At Via Stop  chargeable  → "Via Stop | ⚠ Chargeable"
-      At Via Stop  within free → "Via Stop | ✓ Within Limit"
-      Halted on Road           → "Halted on Road | ⚠ Long Halt (≥Xh)"
+    Return the via stops that ENDED this cycle (was "At Via Stop", now isn't).
+    Non-via stoppages are intentionally excluded.
     """
-    new_stage: dict = stage_map or {}
-
     departed = []
     for vno, prev in snapshot.items():
-        prev_st = prev.get("stage", "")
-        if prev_st not in _LOG_STAGES:
+        if prev.get("stage", "") != "At Via Stop":
             continue
-        if new_stage.get(vno, "") == prev_st:
-            continue   # vehicle is still in the same stop — nothing to log yet
-
+        if (stage_map or {}).get(vno, "") == "At Via Stop":
+            continue   # still at the via — log when it leaves
         stop_hrs = parse_stoppage_hrs(prev["duration"])
-
-        # Filter short road halts — only meaningful long pauses
-        if prev_st == "Halted on Road" and stop_hrs < ROAD_HALT_LOG_HRS:
-            continue
-
-        excess = max(0.0, stop_hrs - FREE_WINDOW_HRS) if prev_st == "At Via Stop" else 0.0
+        excess   = max(0.0, stop_hrs - FREE_WINDOW_HRS)
         departed.append({
-            "vno":       vno,
-            "rps":       prev["rps"],
-            "route":     prev["route"],
-            "location":  prev["location"],
-            "since":     prev["since"],
-            "duration":  prev["duration"],
-            "excess":    excess,
-            "stop_type": prev_st,
+            "vno":      vno,
+            "rps":      prev["rps"],
+            "route":    prev["route"],
+            "location": prev["location"],
+            "since":    prev["since"],
+            "duration": prev["duration"],
+            "excess":   excess,
         })
-
-    if not departed:
-        return
-
-    sl_ws   = get_or_create_tab(ss, STOPPAGE_LOG_TAB, STOPLOG_HEADERS)
-    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    today   = datetime.now().strftime("%d/%m/%Y")
-
-    existing       = sl_ws.get_all_values()
-    next_row       = len(existing) + 1
-    new_rows       = []
-    color_requests = []
-
-    for d in departed:
-        st = d["stop_type"]
-
-        if st == "At Via Stop":
-            free_str   = hrs_to_hms(FREE_WINDOW_HRS)
-            excess_str = hrs_to_hms(d["excess"]) if d["excess"] > 0 else "—"
-            remarks    = ("Via Stop | ⚠ Chargeable" if d["excess"] > 0
-                          else "Via Stop | ✓ Within Limit")
-            color      = LOG_COLOR_EXCESS if d["excess"] > 0 else LOG_COLOR_OK
-
-        else:   # "Halted on Road"
-            free_str   = "—"
-            excess_str = "—"
-            remarks    = f"Halted on Road | ⚠ Long Halt (≥{ROAD_HALT_LOG_HRS:.0f}h)"
-            color      = LOG_COLOR_EXCESS
-
-        row = [today, d["vno"], d["rps"], d["route"], d["location"],
-               d["since"], now_str, d["duration"],
-               free_str, excess_str, remarks]
-        new_rows.append(row)
-        color_requests.append({"repeatCell": {
-            "range": {"sheetId": sl_ws.id,
-                      "startRowIndex": next_row - 1, "endRowIndex": next_row,
-                      "startColumnIndex": 0, "endColumnIndex": len(STOPLOG_HEADERS)},
-            "cell": {"userEnteredFormat": {"backgroundColor": color}},
-            "fields": "userEnteredFormat.backgroundColor",
-        }})
-        next_row += 1
-
-    sl_ws.append_rows(new_rows, value_input_option="RAW")
-    if color_requests:
-        ss.batch_update({"requests": color_requests})
-
-    n_via  = sum(1 for d in departed if d["stop_type"] == "At Via Stop")
-    n_road = sum(1 for d in departed if d["stop_type"] == "Halted on Road")
-    print(f"  [Stoppage Log] +{len(new_rows)} stop(s) logged  "
-          f"[via={n_via}  road={n_road}]", flush=True)
+    return departed
 
 
 def load_shared(ss, vehicles: list[dict]) -> dict:
@@ -1489,7 +1435,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             consigner_name  = (v.get("consignerName") or "").strip()
             consignee_names = [n.strip() for n in (v.get("consigneeName") or "").split(";")
                                if n.strip()]
-            route_hub_names = ([consigner_name] if consigner_name else []) + consignee_names
+            route_hub_names = consignee_names  # origin is not a via stop
 
             # Queue planned hubs missing coords for manual entry (master only).
             if do_side_effects and v.get("isOnTrip"):
@@ -1558,12 +1504,12 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
 
             # Colors follow the value actually shown in each indicator column.
             status_color = STATUS_COLORS.get(status, WHITE)
-            ontime_color = ONTIME_COLORS.get(row_data[12], WHITE)
+            ontime_color = ONTIME_COLORS.get(row_data[11], WHITE)
 
             color_requests.extend([
-                _cell_color(ws.id, trk_row, 10, status_color),   # Status
-                _cell_color(ws.id, trk_row, 11, stage_color),    # Current_Stage
-                _cell_color(ws.id, trk_row, 12, ontime_color),   # Ontime_Delay
+                _cell_color(ws.id, trk_row, 9,  status_color),   # Status
+                _cell_color(ws.id, trk_row, 10, stage_color),    # Current_Stage
+                _cell_color(ws.id, trk_row, 11, ontime_color),   # Ontime_Delay
             ])
 
         except Exception as exc:
@@ -1619,9 +1565,10 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
               f"{len(assignments)} rows, {len(tracking_updates)} cell updates, "
               f"{removed} stale row(s), {edits_kept} user edit(s) kept "
               f"— write skipped.", flush=True)
-        return
+        return stage_snapshot, stage_map
 
     if tracking_updates:
+        _ensure_rows(ws, max(assignments.values(), default=DATA_START))
         ws.batch_update(tracking_updates, value_input_option="RAW")
     if shadow_updates:
         # Shadow has its own row positions (vno-keyed). Keeps the per-cell
@@ -1636,9 +1583,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
           f"{f' | {removed} removed' if removed else ''}"
           f"{f' | {edits_kept} edits kept' if edits_kept else ''}", flush=True)
 
-    # Stoppage log — master only (the hub sheets are Tracking-only mirrors).
-    if do_side_effects:
-        detect_and_log_long_stops(ss, stage_snapshot, vehicles, stage_map)
+    return stage_snapshot, stage_map
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -1648,11 +1593,12 @@ def run_once(dry_run: bool = False):
     print(f"\n[{ts}] Refreshing…", flush=True)
     vehicles = fetch_vehicles()
 
-    # ── Master file: all vehicles + side tabs + stoppage log ─────────────────
+    # ── Master file: all vehicles + side tabs ─────────────────────────────────
     ss, ws = connect()                       # master
     shared = load_shared(ss, vehicles)
-    write_tracking(ss, ws, vehicles, shared, dry_run=dry_run,
-                   do_side_effects=True, remove_strangers=False)
+    master_snapshot, master_stage_map = write_tracking(
+        ss, ws, vehicles, shared, dry_run=dry_run,
+        do_side_effects=True, remove_strangers=False)
 
     # ── Hub mirrors: each gets ONLY its hub's vehicles (Tracking tab) ────────
     vehicle_hub = shared["vehicle_hub"]
