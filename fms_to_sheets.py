@@ -9,9 +9,11 @@ Run once   : python fms_to_sheets.py
 Dry run    : python fms_to_sheets.py --dry-run
 Auto loop  : python fms_to_sheets.py --loop --interval 600
 """
-import sys, re, time, argparse, json, traceback, math
+import sys, re, time, argparse, json, traceback, math, warnings
 from datetime import datetime, timedelta
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 import requests
 import gspread
@@ -41,6 +43,45 @@ HUB_TRACKING_SHEETS = {
     "Ambala":       ("1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE", "Tracking"),
     "Ambala Local": ("1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ", "Tracking"),
 }
+
+# Per-hub trip (MIS) sheets — completed trip log, tab per month
+HUB_TRIP_SHEETS = {
+    "Ambala": "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo",
+}
+
+# RPS Report API — plain HTTP, requires X-Requested-With header
+RPS_REPORT_URL = (
+    "http://smart.dsmsoft.com/FMSSmartApp/"
+    "Safex_RPS_Reports/WebService.asmx/getRpsReportData"
+)
+RPS_REPORT_HEADERS = {
+    "Accept":           "*/*",
+    "Content-Type":     "application/json; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin":           "http://smart.dsmsoft.com",
+    "Referer":          (
+        "http://smart.dsmsoft.com/FMSSmartApp/"
+        "Safex_RPS_Reports/RPS_Reports.aspx?usergroup=NRM.101"
+    ),
+    "User-Agent":       (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/148.0.0.0 Safari/537.36"
+    ),
+}
+
+TRIP_HEADERS = [
+    "RPS_Number", "Vehicle_Number", "Vehicle_Size",
+    "Driver_Name", "Driver_Code",
+    "Route", "Route_Code", "Route_TAT",
+    "Start_Time", "End_Time",
+    "Transit_Time", "Extra_Touching_Time", "Actual_Transit_Time",
+    "Delay_Hours", "Status",
+    "Given_Advance", "Given_Diesel", "Diesel_Amount",
+    "Given_Toll", "Given_Challan", "Extra_Diesel", "Maintainance",
+    "Close_Status",
+]
+TRIP_NCOLS = len(TRIP_HEADERS)
 CREDS_FILE          = Path(__file__).parent / "credentials.json"
 HUB_CODES_FILE      = Path(__file__).parent / "hub_codes.json"
 BASE_API            = "https://fmssmart.dsmsoft.com/FMSSmart"
@@ -1184,6 +1225,181 @@ def build_row(v: dict, sno: int, existing_arrival: str,
     return row
 
 
+# ── Trip sheet helpers ─────────────────────────────────────────────────────────
+
+def _parse_rps_response(body) -> list[dict]:
+    """
+    Unwrap the RPS Report API response.
+    Format: {"d": "22*104663*[{...}]"} — count*id* prefix before JSON array.
+    """
+    if isinstance(body, list):
+        return body
+    if not isinstance(body, dict):
+        return []
+    val = body.get("d")
+    if not val:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        json_str = val.strip()
+        if json_str and json_str[0].isdigit():
+            bracket = json_str.find("[")
+            brace   = json_str.find("{")
+            start   = -1
+            if bracket != -1 and (brace == -1 or bracket < brace):
+                start = bracket
+            elif brace != -1:
+                start = brace
+            if start != -1:
+                json_str = json_str[start:]
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
+
+
+def fetch_rps_closure(rps_no: str, vehicle_no: str,
+                      dispatch_date_str: str) -> str:
+    """
+    Call getRpsReportData for a 10-day window around dispatch_date.
+    Returns the POD_DATE (closure date) string, or "" if not found.
+    """
+    dispatch_dt = _parse_since_dt(dispatch_date_str) or datetime.now()
+    from_dt = dispatch_dt - timedelta(days=5)
+    to_dt   = dispatch_dt + timedelta(days=5)
+    payload = {
+        "from_time": from_dt.strftime("%Y-%m-%d 00:00:00"),
+        "to_time":   to_dt.strftime("%Y-%m-%d 00:00:00"),
+        "vehicleno": [vehicle_no],
+    }
+    try:
+        resp = requests.post(
+            RPS_REPORT_URL, headers=RPS_REPORT_HEADERS,
+            json=payload, timeout=30, verify=False,
+        )
+        resp.raise_for_status()
+        records = _parse_rps_response(resp.json())
+    except Exception as exc:
+        print(f"  [RPS API] Error for {vehicle_no}/{rps_no}: {exc}", flush=True)
+        return ""
+
+    for rec in records:
+        rec_rps = ""
+        for f in ("RPS_Number", "lrNumber", "rpsNumber", "tripId"):
+            v = str(rec.get(f) or "").strip()
+            if v:
+                rec_rps = v
+                break
+        if rec_rps and rec_rps != rps_no:
+            continue
+        for f in ("POD_DATE", "pod_date", "closureDate", "deliveryDate", "endDate"):
+            v = str(rec.get(f) or "").strip()
+            if v and v not in ("null", "None", "0", ""):
+                return v
+    return ""
+
+
+def _get_or_create_trip_tab(ss, tab_name: str) -> gspread.Worksheet:
+    try:
+        ws = ss.worksheet(tab_name)
+        if ws.row_values(1) != TRIP_HEADERS:
+            ws.update(values=[TRIP_HEADERS], range_name="A1",
+                      value_input_option="RAW")
+        return ws
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=tab_name, rows=2000, cols=TRIP_NCOLS)
+        ws.update(values=[TRIP_HEADERS], range_name="A1", value_input_option="RAW")
+        ss.batch_update({"requests": [
+            {"repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": TRIP_NCOLS},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": HEADER_COLOR,
+                    "textFormat": {"foregroundColor": WHITE,
+                                   "bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                }},
+                "fields": ("userEnteredFormat("
+                           "backgroundColor,textFormat,horizontalAlignment)"),
+            }},
+            {"setDataValidation": {
+                "range": {"sheetId": ws.id, "startRowIndex": 1,
+                          "endRowIndex": 2000,
+                          "startColumnIndex": TRIP_NCOLS - 1,
+                          "endColumnIndex": TRIP_NCOLS},
+                "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
+            }},
+        ]})
+        return ws
+
+
+def _write_trip_row(ss, ws: gspread.Worksheet, r: int, data: dict):
+    """Write one completed-trip row with formulas. r is 1-based row number."""
+    row_values = [
+        data.get("RPS_Number",     ""),
+        data.get("Vehicle_Number", ""),
+        data.get("Vehicle_Size",   ""),
+        data.get("Driver_Name",    ""),
+        data.get("Driver_Code",    ""),
+        data.get("Route",          ""),
+        data.get("Route_Code",     ""),
+        data.get("Route_TAT",      ""),   # hours/24 day-fraction; formatted [h]:mm
+        data.get("Start_Time",     ""),
+        data.get("End_Time",       ""),
+        f"=J{r}-I{r}",                                # K  Transit_Time
+        "",                                            # L  Extra_Touching_Time (manual)
+        f"=IF(L{r}=\"\",K{r},K{r}-L{r})",            # M  Actual_Transit_Time
+        f"=IF(M{r}>H{r},M{r}-H{r},0)",               # N  Delay_Hours (H already day-frac)
+        f'=IF(N{r}=0,"On Time","Delayed")',           # O  Status
+        data.get("Given_Advance",  ""),
+        data.get("Given_Diesel",   ""),
+        data.get("Diesel_Amount",  ""),
+        data.get("Given_Toll",     ""),
+        data.get("Given_Challan",  ""),
+        data.get("Extra_Diesel",   ""),
+        data.get("Maintainance",   ""),
+        False,                                         # W  Close_Status checkbox
+    ]
+    ws.update(values=[row_values], range_name=f"A{r}",
+              value_input_option="USER_ENTERED")
+    # Format H (Route_TAT), K (Transit_Time), M (Actual_Transit_Time),
+    # N (Delay_Hours) as [h]:mm
+    fmt_reqs = [{"repeatCell": {
+        "range": {"sheetId": ws.id,
+                  "startRowIndex": r - 1, "endRowIndex": r,
+                  "startColumnIndex": ci, "endColumnIndex": ci + 1},
+        "cell": {"userEnteredFormat": {
+            "numberFormat": {"type": "TIME", "pattern": "[h]:mm"},
+        }},
+        "fields": "userEnteredFormat.numberFormat",
+    }} for ci in (7, 10, 12, 13)]
+    ss.batch_update({"requests": fmt_reqs})
+
+
+def _write_completed_trip(trip_ss, tab_name: str, trip_data: dict):
+    """Append a completed trip to the MIS tab. Silently skips duplicates."""
+    rps_no = trip_data.get("RPS_Number", "")
+    if not rps_no:
+        return
+    ws = _get_or_create_trip_tab(trip_ss, tab_name)
+    if rps_no in ws.col_values(1):
+        return   # already logged
+    end_time = fetch_rps_closure(
+        rps_no,
+        trip_data.get("Vehicle_Number", ""),
+        trip_data.get("Start_Time", ""),
+    )
+    trip_data["End_Time"] = end_time
+    row_num = len(ws.col_values(1)) + 1
+    _write_trip_row(trip_ss, ws, row_num, trip_data)
+    print(f"  [Trip/{tab_name}] Logged RPS {rps_no} "
+          f"(end={end_time or 'pending'})", flush=True)
+
+
 # ── Main update ────────────────────────────────────────────────────────────────
 
 def _collect_via_departures(snapshot: dict, stage_map: dict) -> list[dict]:
@@ -1335,7 +1551,8 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
 
 def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict,
                    dry_run: bool = False, do_side_effects: bool = False,
-                   remove_strangers: bool = False):
+                   remove_strangers: bool = False,
+                   trip_sheet_id: str | None = None):
     """
     Write the Tracking tab for one spreadsheet from `vehicles` (already filtered
     to the right subset) using the `shared` lookups.
@@ -1411,6 +1628,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     missing_coord_hubs: dict[str, str] = {}
     missing_sla:    dict = {}    # route_code → True, pending operator SLA hours
     edits_kept = 0
+    completed_trips: list = []   # trips to log to MIS sheet this cycle
 
     def _cell_color(sheet_id: int, row_num: int, col_idx: int, bg: dict) -> dict:
         return {"repeatCell": {
@@ -1458,6 +1676,43 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
                                               route_hub_names)
             status             = derive_status(v, stage)
             stage_map[vno]     = stage
+
+            # ── Completed trip detection ──────────────────────────────────────
+            # Fires when isOnTrip just flipped False and vehicle is at destination.
+            # Capture data from live_row (still has the on-trip values before we
+            # overwrite them with "Not Assigned" in this cycle's batch_update).
+            if (trip_sheet_id and not dry_run
+                    and not v.get("isOnTrip")
+                    and stage == "Reached-Unloading"):
+                rps_no = prev_snap.get("rps", "")
+                if rps_no:
+                    def _lv(col: int, _row=live_row) -> str:
+                        return (_row[col].strip()
+                                if _row and col < len(_row) else "")
+                    live_rcode = _lv(6)
+                    if live_rcode in ("Not Assigned", NOT_ASSIGNED, ""):
+                        live_rcode = prev_snap.get("route", "")
+                    if live_rcode in ("Not Assigned", NOT_ASSIGNED):
+                        live_rcode = ""
+                    tat_hrs  = sla_map.get(live_rcode.upper()) if live_rcode else None
+                    completed_trips.append({
+                        "RPS_Number":     rps_no,
+                        "Vehicle_Number": vno,
+                        "Vehicle_Size":   vt_sheet.get(vno, ""),
+                        "Driver_Name":    _lv(15),
+                        "Driver_Code":    _lv(16),
+                        "Route":          _lv(5),
+                        "Route_Code":     live_rcode,
+                        "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
+                        "Start_Time":     _lv(7),
+                        "Given_Advance":  _lv(17),
+                        "Given_Diesel":   _lv(18),
+                        "Diesel_Amount":  _lv(19),
+                        "Given_Toll":     _lv(20),
+                        "Given_Challan":  _lv(21),
+                        "Extra_Diesel":   _lv(22),
+                        "Maintainance":   _lv(23),
+                    })
 
             # Queue routes with no SLA entry yet (master only) → operator fills hours.
             route_code = build_route_code(v, hub_map)
@@ -1583,6 +1838,19 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
           f"{f' | {removed} removed' if removed else ''}"
           f"{f' | {edits_kept} edits kept' if edits_kept else ''}", flush=True)
 
+    # ── Write completed trips to MIS sheet (hub sheets only) ─────────────────
+    if completed_trips and trip_sheet_id:
+        try:
+            trip_ss = _gspread_client().open_by_key(trip_sheet_id)
+            for trip in completed_trips:
+                start_dt = _parse_since_dt(trip.get("Start_Time", ""))
+                tab_name = (start_dt.strftime("%B_%Y_MIS") if start_dt
+                            else datetime.now().strftime("%B_%Y_MIS"))
+                _write_completed_trip(trip_ss, tab_name, trip)
+        except Exception as exc:
+            print(f"  [WARN] Trip sheet write failed: {exc}", flush=True)
+            traceback.print_exc()
+
     return stage_snapshot, stage_map
 
 
@@ -1610,7 +1878,8 @@ def run_once(dry_run: bool = False):
         try:
             hub_ss, hub_ws = connect(sheet_id, tab)
             write_tracking(hub_ss, hub_ws, subset, shared, dry_run=dry_run,
-                           do_side_effects=False, remove_strangers=True)
+                           do_side_effects=False, remove_strangers=True,
+                           trip_sheet_id=HUB_TRIP_SHEETS.get(hub_name) or None)
         except Exception as exc:
             # One bad hub sheet must not break the master or the other hubs.
             print(f"  [ERROR] Hub '{hub_name}' update failed: {exc}", flush=True)
